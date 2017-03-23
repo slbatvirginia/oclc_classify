@@ -20,95 +20,100 @@ import (
 
 var OCLCSite string = "http://classify.oclc.org/classify2/Classify?"
 
-func getOCLCResp(keyType string, keyValue string) []byte {
+type MostRecent struct {
+	Sfa string `xml:"sfa,attr"`
+}
+type Work struct {
+	Owi string `xml:"owi,attr"`
+	Wi string `xml:"wi,attr"`
+}
+type Response struct {
+	Code string `xml:"code,attr"`
+}
+type Input struct {
+	InType string `xml:"type,attr"`
+	Value string `xml:",chardata"`
+}
+type OCLCResp struct {
+	XMLName xml.Name `xml:"classify"`
+	Response Response `xml:"response"`
+	Input Input `xml:"input"`
+	Works []Work `xml:"works>work"`
+	Recommendations MostRecent `xml:"recommendations>lcc>mostRecent"`
+}
+
+
+func OCLCQuery(keyType string, keyValue string) (OCLCResp, string) {
 //	accept query parameters and query OCLC classify site
 //		return the response as byte array
+	parsedResp := OCLCResp{}
 	qs := url.Values{}
 	qs.Add(keyType, keyValue)
 	qs.Add("summary", "true")
-	resp, err := http.Get(OCLCSite + qs.Encode())
-	defer resp.Body.Close()
+	queryResp, err := http.Get(OCLCSite + qs.Encode())
+	defer queryResp.Body.Close()
 	if err != nil {
 		fmt.Println(err)
 	}
-	b, err := ioutil.ReadAll(resp.Body)
+	xmlResp, err := ioutil.ReadAll(queryResp.Body)
 	if err != nil {
-		fmt.Println("bad response from OCLC")
+		fmt.Println("bad http response from OCLC")
 	}
-	return b
-	
+	xml.Unmarshal(xmlResp,&parsedResp)
+	return parsedResp, parsedResp.Response.Code
 }
 
-func getSfa(inValue string) string {
-//
-//	unmarshall the xml response 
-//	parse the resulting struct to extract a call number
-//		for single work responses, use recommendations>lcc>mostRecent>sfa
-//		for multiple work responses, requery using owi or wi from first work
-//			
-	type MostRecent struct {
-		Sfa string `xml:"sfa,attr"`
+func OCLCRespReader(keyType string, keyValue string) OCLCResp {
+//	OCLC returns spurious errors that often correct themselves on subsequent tries
+//		Let's try three times if we have to.
+	goodResp := false
+	var resp OCLCResp
+	var rcode string = "none"
+	
+	for i := 0; i < 5; i++ {
+		resp, rcode = OCLCQuery(keyType, keyValue)
+		switch rcode {
+			case "0": goodResp = true
+			case "4": goodResp = true
+			case "2": goodResp = true
+		}
+		if goodResp {
+			break
+		}
+		time.Sleep(3 * time.Millisecond)
 	}
-	type Work struct {
-		Owi string `xml:"owi,attr"`
-		Wi string `xml:"wi,attr"`
-	}
-	type ResponseCode struct {
-		Code string `xml:"code,attr"`
-	}
-	type Input struct {
-		InType string `xml:"type,attr"`
-		Value string `xml:",chardata"`
-	}
-	type OCLCresp struct {
-		XMLName xml.Name `xml:"classify"`
-		ResponseCode ResponseCode `xml:"response"`
-		Input Input `xml:"input"`
-		Works []Work `xml:"works>work"`
-		Recommendations MostRecent `xml:"recommendations>lcc>mostRecent"`
-	}
-	XMLResp := OCLCresp{}
-	respBody := getOCLCResp("issn",inValue)
-	xml.Unmarshal(respBody, &XMLResp)
-	TagValue := ""
-	Tag := ""
-	// see if you can get an sfa value from response(s)
-	if  strings.Compare(XMLResp.ResponseCode.Code,"0") == 0 {
-	// single work summary
-		Tag = "sfa"
-		TagValue = XMLResp.Recommendations.Sfa
+	return resp
+}
+	
+
+func SfaReader(colType string, inValue string) string {
+	sfa := ""
+	queryResp := OCLCRespReader(colType, inValue)
+	if  strings.Compare(queryResp.Response.Code,"0") == 0 {
+	// single work summary - done
+		sfa = queryResp.Recommendations.Sfa
 	} else {
-		if  strings.Compare(XMLResp.ResponseCode.Code,"4") == 0 {
-		// multiple works 
+		if  strings.Compare(queryResp.Response.Code,"4") == 0 {
+		// multiple works - try to use first work fields for second query
 		// first try owi of first work
-			owi := XMLResp.Works[0].Owi
-			wi := XMLResp.Works[0].Wi
-			XMLResp := OCLCresp{}
-			respBody = getOCLCResp("oclc",owi)
-			xml.Unmarshal(respBody,&XMLResp)
-			if  strings.Compare(XMLResp.ResponseCode.Code,"0") == 0 {
-			// got a hit
-				Tag = "sfa"
-				TagValue = XMLResp.Recommendations.Sfa
+			owi := queryResp.Works[0].Owi
+			wi := queryResp.Works[0].Wi
+			queryResp = OCLCRespReader("oclc",owi)
+			if  strings.Compare(queryResp.Response.Code,"0") == 0 {
+			// got a hit - done
+				sfa = queryResp.Recommendations.Sfa
 			} else {
 			// failed - try the wi of first work
-				XMLResp := OCLCresp{}
-				respBody = getOCLCResp("oclc",wi)
-				xml.Unmarshal(respBody,&XMLResp)
-				if  strings.Compare(XMLResp.ResponseCode.Code,"0") == 0 {
-				// finally
-					Tag = "sfa"
-					TagValue = XMLResp.Recommendations.Sfa
+				queryResp = OCLCRespReader("oclc",wi)
+				if  strings.Compare(queryResp.Response.Code,"0") == 0 {
+				// finally - done
+					sfa = queryResp.Recommendations.Sfa
 				}
 			}
 		} 
 	}
 	
-	if strings.Compare(Tag,"sfa") == 0 {
-		return TagValue
-	} else {
-		return ""
-	}
+	return sfa
 }
 
 
@@ -117,7 +122,6 @@ func matchColHeader(headerRow xlsx.Row, matchName string) int {
 	for nCell, iCell := range headerRow.Cells {
 		iValue, err := iCell.String()
 		if err != nil {
-			fmt.Printf("bad header cell %d\n",nCell)
 			iValue = "none"
 		}
 
@@ -136,11 +140,12 @@ func main() {
 	current_time:= time.Now().Local()
 	version = current_time.Format("20060102");
 	fmt.Printf("compiled %s\n",version);
-	var inFile, outFile, colName string
+	var inFile, outFile, colName, colType string
 	flag.StringVar(&inFile, "infile", "./in.xlsx", "input file")
 	flag.StringVar(&outFile, "outfile", "./out.xlsx", "output file")
 	flag.StringVar(&colName, "colname", "none", "xcel col hdr to match (overides pos)")
-	var colNbr int
+	flag.StringVar(&colType, "coltype", "issn", "name of OCLC query parameter")
+	var colNbr int = -1
 
 	colPosPtr :=flag.Int("colpos", 2, "xcel column position to use ")
 	flag.Parse()
@@ -158,7 +163,7 @@ func main() {
 
 //  	if passed in column header, override position with matching column
 	if strings.Compare(colName,"none") != 0 {
-		fmt.Printf("Using col heading %s\n",colName)
+		fmt.Printf("matching on col heading %s\n",colName)
 		headerRow := xfilein.Sheets[0].Rows[0]
 		colNbr = matchColHeader(*headerRow,colName)	
 	}
@@ -173,6 +178,7 @@ func main() {
 
 //      Process rows in spreadsheet, create new spreadsheet
 	got := 0
+	tried := 0
 	for  nRow, iRow := range xfilein.Sheets[0].Rows {
 		oRow := osheet.AddRow()
 		var iStyle *xlsx.Style
@@ -186,11 +192,13 @@ func main() {
 			oCell.SetString(iValue)
 
 		    	if nCell == colNbr {
-				sfaValue = getSfa(iValue)
-				if strings.Compare(sfaValue,"") != 0 {
-					got = got + 1
-				}	
-					
+				if strings.Compare(iValue,"") != 0 {
+					tried = tried + 1
+					sfaValue = SfaReader(colType,iValue)
+					if strings.Compare(sfaValue,"") != 0 {
+						got = got + 1
+					}	
+				}
 			}
 		}
 			
@@ -205,6 +213,7 @@ func main() {
 		}
 	}
 // 	Save the new spreadsheet containing sfa values
+	fmt.Printf("tried %d, got values for %d\n",tried,got)
 	err =  xfileout.Save(outFile)
 	if err != nil {
 		fmt.Printf("Error %s saving file %s\n",err,outFile)
